@@ -1,0 +1,7 @@
+.idea
+__pycache__
+python36venv
+spark-warehouse
+*.log
+output
+data
