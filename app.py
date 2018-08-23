@@ -155,7 +155,7 @@ def haversine_distance(row):
 
 def pivot_column(df, column, distinct_col):
     """
-    create machine learning features by pivotting that data
+    Create machine learning features by pivotting that data
 
     :param df: Dataframe with multiple records per sample and a rank column
     :param column: column name to pivot on
@@ -173,7 +173,7 @@ def pivot_column(df, column, distinct_col):
 
 
 def merge_accidents(taxi_data, accident_data):
-    if config.MODE == 'dev-test':
+    if config.MODE == 'dev':
         logging.info(f'Selecting a random 0.1% of data before merging, this is to save time in dev mode')
         # Get a random 1% of data with random seed=1
         splits = taxi_data.randomSplit([0.999, 0.001], 1)
@@ -264,7 +264,7 @@ def main():
     logging.info('Data preparation complete')
     # RDD has a countApprox() function that is quicker than .count(), unsure if the conversion from DataFrame to RDD
     # cancels out the savings
-    logging.info(f'Number of rows: {df.rdd.countApprox(1000)}')
+    logging.info(f'Number of rows: {df.rdd.countApprox(10)}')
     logging.info(f'Data schema: \n{df._jdf.schema().treeString()}')
 
     # TODO extract all this to function(s)
@@ -317,9 +317,14 @@ def main():
 
     # TODO extract this to a function
     # Save the outputs (predictions and model)
+
+    import uuid
+
+    run_id = uuid.uuid4()
+
     date = datetime.date.today()
-    model_pipeline.save(f'{config.MODEL_DIR}/model-{config.MODE}-{date}')
-    predictions.select("prediction", "label").write.csv(f'{config.PREDICTIONS_DIR}/predictions-{config.MODE}-{date}.csv')
+    model_pipeline.save(f'{config.MODEL_DIR}/{run_id}/model-{config.MODE}-{date}')
+    predictions.select("prediction", "label").write.csv(f'{config.PREDICTIONS_DIR}/{run_id}/predictions-{config.MODE}-{date}.csv')
 
     # Print some cool stuff about the model
     gbt_model = model_pipeline.stages[2]

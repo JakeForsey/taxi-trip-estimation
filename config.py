@@ -7,7 +7,7 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType, TimestampType
 # dev       2 taxi journey files
 # prod      all taxi journey files
 # dev-test  2 taxi journey files 0.001 of all records
-MODE = 'dev'
+MODE = 'prod'
 
 DATA_DIR = f'data/{MODE}'
 MODEL_DIR = f'ouput/models/{MODE}'
