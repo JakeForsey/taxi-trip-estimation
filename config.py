@@ -71,6 +71,7 @@ TAXI_DATA_SCHEMA = StructType([
     StructField("dropoff_latitude", DoubleType(), True),
     StructField("trip_distance", DoubleType(), True)
 ])
+TAXI_ID_COL = 'trip_id'
 TAXI_VOLUME_PLOT_FILE = f'{PLOT_DIR}/taxi-volumes.png'
 
 ACCIDENT_DATA_URLS = [
@@ -85,6 +86,7 @@ ACCIDENT_DATA_SCHEMA = StructType([
     StructField("number_of_persons_injured", IntegerType(), True),
     StructField("number_of_persons_killed", IntegerType(), True),
 ])
+ACCIDENT_ID_COL = 'accident_id'
 ACCIDENT_VOLUME_PLOT_FILE = f'{PLOT_DIR}/accident-volumes.png'
 
 # How many attempts to make at downloading data before skipping

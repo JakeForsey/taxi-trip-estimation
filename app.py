@@ -7,10 +7,16 @@ import matplotlib.pyplot as plt
 
 from pyspark.sql import SparkSession
 # Some functions imports don't play ball with PyCharm (rank, col sum) but they do work
+# TODO input functions as F and refactor
 from pyspark.sql.functions import date_format, window, countDistinct, unix_timestamp, udf, struct, rank, col, sum, \
-    lit, concat, first
+    lit, concat, first, monotonically_increasing_id, datediff
 from pyspark.sql.window import Window
-from pyspark.sql.types import FloatType
+from pyspark.sql.types import FloatType, IntegerType
+
+from pyspark.ml import Pipeline
+from pyspark.ml.regression import GBTRegressor
+from pyspark.ml.feature import VectorIndexer, VectorAssembler
+from pyspark.ml.evaluation import RegressionEvaluator
 
 import pandas as pd
 
@@ -85,14 +91,11 @@ def load_data(spark_session, data_dir, schema):
 
 def timestamps_to_features(data, timestamp_col):
     logging.info(f'Creating features from {timestamp_col}')
-    # Create new machine learning features from the timestamp
-    data = data.withColumn(f'{timestamp_col}.day_of_week', date_format(timestamp_col, 'u'))
-    data = data.withColumn(f'{timestamp_col}.hour_of_day', date_format(timestamp_col, 'H'))
-    data = data.withColumn(f'{timestamp_col}.month_of_year', date_format(timestamp_col, 'M'))
 
-    # Drop the original timestamp column
-    # TODO should be an option to drop this
-    data = data.drop(timestamp_col)
+    # Create new machine learning features from the timestamp
+    data = data.withColumn(f'{timestamp_col}.day_of_week', date_format(timestamp_col, 'u').cast('integer'))
+    data = data.withColumn(f'{timestamp_col}.hour_of_day', date_format(timestamp_col, 'H').cast('integer'))
+    data = data.withColumn(f'{timestamp_col}.month_of_year', date_format(timestamp_col, 'M').cast('integer'))
 
     return data
 
@@ -132,6 +135,7 @@ def haversine_distance(row):
     lat1, lon1, lat2, lon2 = row
 
     # if any of the values (coordinates) in row are None then return a very large distance
+    # TODO also check for inappropriate data types (e.g. str)
     if None in [lat1, lon1, lat2, lon2]:
         return 999999
 
@@ -147,11 +151,30 @@ def haversine_distance(row):
     return 3959 * c
 
 
+def pivot_column(df, column, distinct_col):
+    """
+    create machine learning features by pivotting that data
+
+    :param df: Dataframe with multiple records per sample and a rank column
+    :param column: column name to pivot on
+    :param distinct_col: column name with a unique value to use for grouping (1 value per trip)
+    :return: pivoted dataframe containing the new features to be joined onto the dataframe
+    """
+    # 1. create a column populated with the name that will be the pivoted columns
+    # 2. group by something unique to the trip
+    # 3. pivot on the rank
+    # 4. grab the first record (there will only be one thanks to the rank function
+    return df.withColumn(f'{column}_rank', concat(lit(f'{column}_'), col('rank')))\
+        .groupBy(distinct_col)\
+        .pivot(f'{column}_rank')\
+        .agg(first(column))
+
+
 def merge_accidents(taxi_data, accident_data):
     if config.MODE == 'dev':
-        logging.info(f'Selecting a random 1% of data before merging, this is to save time in dev mode')
+        logging.info(f'Selecting a random 0.1% of data before merging, this is to save time in dev mode')
         # Get a random 1% of data with random seed=1
-        splits = taxi_data.randomSplit([0.99, 0.01], 1)
+        splits = taxi_data.randomSplit([0.999, 0.001], 1)
         taxi_data = splits[1]
 
     conditions = [
@@ -161,31 +184,29 @@ def merge_accidents(taxi_data, accident_data):
         accident_data['latitude'].isNotNull(),
         accident_data['longitude'].isNotNull()
     ]
-    df = taxi_data.join(accident_data, conditions, 'left_outer')
+    # This join results in a large number of rows per trip
+    temp_df = taxi_data.join(accident_data, conditions, 'left_outer')
 
     # Calculate the distance between the pickup location and the accident
     distance_udf = udf(haversine_distance, FloatType())
-    df = df.withColumn('pickup_to_accident', distance_udf(struct('pickup_latitude', 'pickup_longitude', 'latitude', 'longitude')))
+    temp_df = temp_df.withColumn('pickup_to_accident', distance_udf(struct('pickup_latitude', 'pickup_longitude', 'latitude', 'longitude')))
 
-    # --- This starts to get slow here
+    # --- Create the machine learning features based on the accidents
     # Partitioned by taxi trip, sort by distance from pickup to accident
-    partition = Window.partitionBy(df['pickup_datetime']).orderBy(df['pickup_to_accident'].asc())
+    partition = Window.partitionBy(temp_df[config.TAXI_ID_COL]).orderBy(temp_df['pickup_to_accident'].asc())
+    # Select the first config.ACCIDENT_COUNT rows for each trip
+    temp_df = temp_df.select('*', rank().over(partition).alias('rank')).filter(col('rank') <= config.ACCIDENT_COUNT)
 
-    # Select the first ACCIDENT_COUNT rows from each window partition (aka, the closest two accidents on that day to
-    # the pickup)
-    df = df.select('*', rank().over(partition).alias('rank')).filter(col('rank') <= config.ACCIDENT_COUNT)
+    proximity_feature = pivot_column(temp_df, 'pickup_to_accident', config.TAXI_ID_COL)
+    taxi_data = taxi_data.join(proximity_feature, [config.TAXI_ID_COL], 'left_outer')
 
-    # Pivot the distance column (create a new column for the closest, 2nd closest ... ACCIDENT_COUNT closest accident)
-    # TODO abstract this and do it for number of people killed, number of people injured etc.
-    # TODO figure out why there are null distances in the pivotted data
-    pivot = df.withColumn('pickup_to_accident_rank', concat(lit('pickup_to_accident_'), col('rank')))\
-        .groupBy('pickup_datetime')\
-        .pivot('pickup_to_accident_rank')\
-        .agg(first('pickup_to_accident'))
+    killed_feature = pivot_column(temp_df, 'number_of_persons_killed', config.TAXI_ID_COL)
+    taxi_data = taxi_data.join(killed_feature, [config.TAXI_ID_COL], 'left_outer')
 
-    print(pivot.show(100))
-    # TODO merge the pivoted columns with the df
-    return df
+    injured_feature = pivot_column(temp_df, 'number_of_persons_injured', config.TAXI_ID_COL)
+    taxi_data = taxi_data.join(injured_feature, [config.TAXI_ID_COL], 'left_outer')
+
+    return taxi_data
 
 
 def main():
@@ -211,36 +232,82 @@ def main():
     spark = SparkSession.builder.appName('Basics').getOrCreate()
 
     # --- Load data
-    # Load and parse taxi data
+    # Load and parse taxi data, add an id column
     taxi_df = load_data(spark,
                         data_dir=config.TAXI_DATA_DIR,
-                        schema=config.TAXI_DATA_SCHEMA)
-    # Load and parse accident data
+                        schema=config.TAXI_DATA_SCHEMA)\
+        .withColumn(config.TAXI_ID_COL, monotonically_increasing_id())
+
+    # Load and parse accident data, add an id column and a timestamp column
     accident_df = load_data(spark,
                             data_dir=config.ACCIDENT_DATA_DIR,
-                            schema=config.ACCIDENT_DATA_SCHEMA)
-    accident_df = accident_df.withColumn('accident_timestamp', unix_timestamp(accident_df['date'], 'MM/dd/yyyy').cast('timestamp'))
+                            schema=config.ACCIDENT_DATA_SCHEMA)\
+        .withColumn(config.ACCIDENT_ID_COL, monotonically_increasing_id())\
+        .withColumn('accident_timestamp', unix_timestamp('date', 'MM/dd/yyyy').cast('timestamp'))
 
     # --- Summarise data
     # Plot and save data summary (if its not already saved)
-    plot_summary(taxi_df, 'pickup_datetime', 'pickup_latitude', config.TAXI_VOLUME_PLOT_FILE)
-    plot_summary(accident_df, 'accident_timestamp', 'latitude', config.ACCIDENT_VOLUME_PLOT_FILE)
+    plot_summary(taxi_df, 'pickup_datetime', config.TAXI_ID_COL, config.TAXI_VOLUME_PLOT_FILE)
+    plot_summary(accident_df, 'accident_timestamp', config.ACCIDENT_ID_COL, config.ACCIDENT_VOLUME_PLOT_FILE)
 
     # --- Create ML features
     # Merge nearby accidents with taxi trips (this is a very long running process)
     df = merge_accidents(taxi_df, accident_df)
-    # df.checkpoint()
-    logging.info(f'Number of rows: {df.count}')
-    logging.info(f'Merged data: \n{df.show(100)}')
 
     # Create day of week, hour of day values from time stamp
-    # taxi_df = timestamps_to_features(taxi_df, 'pickup_datetime')
-    # taxi_df = timestamps_to_features(taxi_df, 'dropoff_datetime')
+    df = timestamps_to_features(df, 'pickup_datetime')
+    df = timestamps_to_features(df, 'dropoff_datetime')
 
+    df = df.drop('pickup_datetime')
+    df = df.drop('dropoff_datetime')
+
+    # --- Log the results of the data preparation stages
+    logging.info('Data preparation complete')
+    logging.info(f'Number of rows: {df.count()}')
+    logging.info(f'Merged data: \n{df.show(100)}')
     logging.info(f'Data schema: \n{df._jdf.schema().treeString()}')
+
+    # --- Train a gradient boosted trees model to predict the duration of a trip
+
+    # Create the target variable (label is a special column name in MLlib
+    df = df.withColumn('label', datediff('pickup_datetime', 'dropoff_datetime'))
+    print(df.show(100))
+    ignore = ['label']
+    assembler = VectorAssembler(
+        inputCols=[x for x in df.columns if x not in ignore],
+        outputCol='features')
+    assembler.transform(df)
+
+    feature_indexer = VectorIndexer(inputCol="features", outputCol="indexedFeatures").fit(df)
+
+    # Split the data into training and test sets (30% held out for testing)
+    (training_df, testing_df) = df.randomSplit([0.7, 0.3])
+
+    # Train a GBT model.
+    gbt = GBTRegressor(featuresCol="indexedFeatures", maxIter=10)
+
+    # Chain indexer and GBT in a Pipeline
+    pipeline = Pipeline(stages=[assembler, feature_indexer, gbt])
+
+    # Train model.  This also runs the indexer.
+    model_pipeline = pipeline.fit(training_df)
+
+    # Make predictions.
+    predictions = model_pipeline.transform(testing_df)
+
+    # Select example rows to display
+    predictions.select("prediction", "label", "features").show(5)
+
+    # Select (prediction, true label) and compute test error
+    evaluator = RegressionEvaluator(
+        labelCol="label", predictionCol="prediction", metricName="rmse")
+    rmse = evaluator.evaluate(predictions)
+    logging.info(f'Root Mean Squared Error (RMSE) on test data: {rmse}')
+
+    gbt_model = model_pipeline.stages[1]
+    logging.info(gbt_model)
 
 
 if __name__ == "__main__":
-    print(os.environ)
     logging.basicConfig(level=logging.INFO)
     main()
