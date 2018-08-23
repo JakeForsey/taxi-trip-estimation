@@ -3,10 +3,15 @@ import os
 from pyspark.sql.types import StructType, StructField
 from pyspark.sql.types import DoubleType, IntegerType, StringType, TimestampType, DateType
 
-# dev | prod
+# dev | prod | dev-test
+# dev       2 taxi journey files
+# prod      all taxi journey files
+# dev-test  2 taxi journey files 0.001 of all records
 MODE = 'dev'
 
 DATA_DIR = f'data/{MODE}'
+MODEL_DIR = f'ouput/models/{MODE}'
+PREDICTIONS_DIR = f'output/predictions/{MODE}'
 PLOT_DIR = f'output/plots/{MODE}'
 
 TAXI_DATA_URLS = [
@@ -95,12 +100,19 @@ MAX_CSV_DOWNLOAD_RETRIES = 5
 # How many accidents to pivot / create features for
 ACCIDENT_COUNT = 5
 
+# TODO move this setup up code into app.py
 # Export some key environment variables (make sure this points to the python used to execute the app)
 os.environ["PYSPARK_PYTHON"] = "/home/jake/.conda/envs/pyspark-env/bin/python"
 
 # Create directories
 if not os.path.isdir(DATA_DIR):
     os.makedirs(DATA_DIR)
+
+if not os.path.isdir(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
+
+if not os.path.isdir(PREDICTIONS_DIR):
+    os.makedirs(PREDICTIONS_DIR)
 
 if not os.path.isdir(PLOT_DIR):
     os.makedirs(PLOT_DIR)

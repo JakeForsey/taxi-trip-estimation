@@ -1,6 +1,8 @@
+import datetime
 import logging
 import math
 import os
+from itertools import chain
 from urllib.error import HTTPError
 
 import matplotlib.pyplot as plt
@@ -93,9 +95,9 @@ def timestamps_to_features(data, timestamp_col):
     logging.info(f'Creating features from {timestamp_col}')
 
     # Create new machine learning features from the timestamp
-    data = data.withColumn(f'{timestamp_col}.day_of_week', date_format(timestamp_col, 'u').cast('integer'))
-    data = data.withColumn(f'{timestamp_col}.hour_of_day', date_format(timestamp_col, 'H').cast('integer'))
-    data = data.withColumn(f'{timestamp_col}.month_of_year', date_format(timestamp_col, 'M').cast('integer'))
+    data = data.withColumn(f'{timestamp_col}_day_of_week', date_format(timestamp_col, 'u').cast('integer'))
+    data = data.withColumn(f'{timestamp_col}_hour_of_day', date_format(timestamp_col, 'H').cast('integer'))
+    data = data.withColumn(f'{timestamp_col}_month_of_year', date_format(timestamp_col, 'M').cast('integer'))
 
     return data
 
@@ -171,7 +173,7 @@ def pivot_column(df, column, distinct_col):
 
 
 def merge_accidents(taxi_data, accident_data):
-    if config.MODE == 'dev':
+    if config.MODE == 'dev-test':
         logging.info(f'Selecting a random 0.1% of data before merging, this is to save time in dev mode')
         # Get a random 1% of data with random seed=1
         splits = taxi_data.randomSplit([0.999, 0.001], 1)
@@ -258,35 +260,44 @@ def main():
     df = timestamps_to_features(df, 'pickup_datetime')
     df = timestamps_to_features(df, 'dropoff_datetime')
 
-    df = df.drop('pickup_datetime')
-    df = df.drop('dropoff_datetime')
-
     # --- Log the results of the data preparation stages
     logging.info('Data preparation complete')
-    logging.info(f'Number of rows: {df.count()}')
-    logging.info(f'Merged data: \n{df.show(100)}')
+    # RDD has a countApprox() function that is quicker than .count(), unsure if the conversion from DataFrame to RDD
+    # cancels out the savings
+    logging.info(f'Number of rows: {df.rdd.countApprox(1000)}')
     logging.info(f'Data schema: \n{df._jdf.schema().treeString()}')
 
+    # TODO extract all this to function(s)
     # --- Train a gradient boosted trees model to predict the duration of a trip
+    # Create the target variable ('label' is a special column name in MLlib
+    logging.info('Creating label column (based on the delta between dropoff_datetime and pickup_datetime)')
+    df = df.withColumn('label', unix_timestamp(df['dropoff_datetime']) - unix_timestamp(df['pickup_datetime']))
 
-    # Create the target variable (label is a special column name in MLlib
-    df = df.withColumn('label', datediff('pickup_datetime', 'dropoff_datetime'))
-    print(df.show(100))
-    ignore = ['label']
-    assembler = VectorAssembler(
-        inputCols=[x for x in df.columns if x not in ignore],
-        outputCol='features')
-    assembler.transform(df)
-
-    feature_indexer = VectorIndexer(inputCol="features", outputCol="indexedFeatures").fit(df)
+    # Drop any samples with a NULL value
+    df = df.na.drop(how="any")
 
     # Split the data into training and test sets (30% held out for testing)
     (training_df, testing_df) = df.randomSplit([0.7, 0.3])
 
-    # Train a GBT model.
+    # Define an "VectorAssembler", which joins multiple columns into a single vector
+    ignore = ['label', 'pickup_datetime', 'dropoff_datetime', config.ACCIDENT_ID_COL, config.TAXI_ID_COL]
+    assembler = VectorAssembler(
+        inputCols=[col for col in df.columns if col not in ignore],
+        outputCol='features')
+    # Transform the data using the defined assembler
+    df = assembler.transform(df)
+
+    # Why does some of this look like its wrapped in a tuple?
+    # print(df.select('features').show(10))
+
+    # Define a "VectorIndexer" which converts categorical fields (defined by having less than 20 unique values) into
+    # one-hot (?) encoded data
+    feature_indexer = VectorIndexer(inputCol="features", outputCol="indexedFeatures").fit(df.select('features'))
+
+    # Train a GBT model
     gbt = GBTRegressor(featuresCol="indexedFeatures", maxIter=10)
 
-    # Chain indexer and GBT in a Pipeline
+    # Chain assembler, indexer and GBT in a Pipeline
     pipeline = Pipeline(stages=[assembler, feature_indexer, gbt])
 
     # Train model.  This also runs the indexer.
@@ -304,8 +315,25 @@ def main():
     rmse = evaluator.evaluate(predictions)
     logging.info(f'Root Mean Squared Error (RMSE) on test data: {rmse}')
 
-    gbt_model = model_pipeline.stages[1]
+    # TODO extract this to a function
+    # Save the outputs (predictions and model)
+    date = datetime.date.today()
+    model_pipeline.save(f'{config.MODEL_DIR}/model-{config.MODE}-{date}')
+    predictions.select("prediction", "label").write.csv(f'{config.PREDICTIONS_DIR}/predictions-{config.MODE}-{date}.csv')
+
+    # Print some cool stuff about the model
+    gbt_model = model_pipeline.stages[2]
     logging.info(gbt_model)
+    attrs = sorted(
+        (attr["idx"], attr["name"]) for attr in (chain(*df
+                                                       .schema["features"]
+                                                       .metadata["ml_attr"]["attrs"].values())))
+
+    for idx, name in attrs:
+        if gbt_model.featureImportances[idx]:
+            print(name, gbt_model.featureImportances[idx])
+
+    # dev mode RMSE: 7881.198866075524
 
 
 if __name__ == "__main__":
