@@ -135,11 +135,9 @@ def haversine_distance(row):
     :return: FloatType distance in miles between the two points
     """
     lat1, lon1, lat2, lon2 = row
-
-    # if any of the values (coordinates) in row are None then return a very large distance
-    # TODO also check for inappropriate data types (e.g. str)
-    if None in [lat1, lon1, lat2, lon2]:
-        return 999999
+    for coord in [lat1, lon1, lat2, lon2]:
+        if coord is None or isinstance(coord, str):
+            return 99999
 
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -173,11 +171,6 @@ def pivot_column(df, column, distinct_col):
 
 
 def merge_accidents(taxi_data, accident_data):
-    if config.MODE == 'dev':
-        logging.info(f'Selecting a random 0.1% of data before merging, this is to save time in dev mode')
-        # Get a random 1% of data with random seed=1
-        splits = taxi_data.randomSplit([0.999, 0.001], 1)
-        taxi_data = splits[1]
 
     conditions = [
         # Join all accidents that on are the same date as the taxi trip
@@ -186,25 +179,31 @@ def merge_accidents(taxi_data, accident_data):
         accident_data['latitude'].isNotNull(),
         accident_data['longitude'].isNotNull()
     ]
+    logging.info('Joining taxi data with accident data')
     # This join results in a large number of rows per trip
     temp_df = taxi_data.join(accident_data, conditions, 'left_outer')
 
+    logging.info('Calculating the distance between trip pickup location and the accident')
     # Calculate the distance between the pickup location and the accident
     distance_udf = udf(haversine_distance, FloatType())
     temp_df = temp_df.withColumn('pickup_to_accident', distance_udf(struct('pickup_latitude', 'pickup_longitude', 'latitude', 'longitude')))
 
+    logging.info('Partitioning and sorting data')
     # --- Create the machine learning features based on the accidents
     # Partitioned by taxi trip, sort by distance from pickup to accident
     partition = Window.partitionBy(temp_df[config.TAXI_ID_COL]).orderBy(temp_df['pickup_to_accident'].asc())
     # Select the first config.ACCIDENT_COUNT rows for each trip
     temp_df = temp_df.select('*', rank().over(partition).alias('rank')).filter(col('rank') <= config.ACCIDENT_COUNT)
 
+    logging.info('Pivoting distances')
     proximity_feature = pivot_column(temp_df, 'pickup_to_accident', config.TAXI_ID_COL)
     taxi_data = taxi_data.join(proximity_feature, [config.TAXI_ID_COL], 'left_outer')
 
+    logging.info('Pivoting persons killed')
     killed_feature = pivot_column(temp_df, 'number_of_persons_killed', config.TAXI_ID_COL)
     taxi_data = taxi_data.join(killed_feature, [config.TAXI_ID_COL], 'left_outer')
 
+    logging.info('Pivoting injured')
     injured_feature = pivot_column(temp_df, 'number_of_persons_injured', config.TAXI_ID_COL)
     taxi_data = taxi_data.join(injured_feature, [config.TAXI_ID_COL], 'left_outer')
 
@@ -240,6 +239,11 @@ def main():
                         schema=config.TAXI_DATA_SCHEMA)\
         .withColumn(config.TAXI_ID_COL, monotonically_increasing_id())
 
+    logging.info(f'Selecting a random {config.SAMPLE_RATE * 100}% of data before merging')
+    # Get a random 1% of data with random seed=1
+    splits = taxi_df.randomSplit([1 - config.SAMPLE_RATE, config.SAMPLE_RATE], seed=1)
+    taxi_df = splits[1]
+
     # Load and parse accident data, add an id column and a timestamp column
     accident_df = load_data(spark,
                             data_dir=config.ACCIDENT_DATA_DIR,
@@ -249,8 +253,9 @@ def main():
 
     # --- Summarise data
     # Plot and save data summary (if its not already saved)
-    plot_summary(taxi_df, 'pickup_datetime', config.TAXI_ID_COL, config.TAXI_VOLUME_PLOT_FILE)
-    plot_summary(accident_df, 'accident_timestamp', config.ACCIDENT_ID_COL, config.ACCIDENT_VOLUME_PLOT_FILE)
+
+    # plot_summary(taxi_df, 'pickup_datetime', config.TAXI_ID_COL, config.TAXI_VOLUME_PLOT_FILE)
+    # plot_summary(accident_df, 'accident_timestamp', config.ACCIDENT_ID_COL, config.ACCIDENT_VOLUME_PLOT_FILE)
 
     # --- Create ML features
     # Merge nearby accidents with taxi trips (this is a very long running process)
@@ -273,9 +278,24 @@ def main():
     logging.info('Creating label column (based on the delta between dropoff_datetime and pickup_datetime)')
     df = df.withColumn('label', unix_timestamp(df['dropoff_datetime']) - unix_timestamp(df['pickup_datetime']))
 
+    logging.info('Dropping rows that contain null (for a subset of columns)')
     # Drop any samples with a NULL value
-    df = df.na.drop(how="any")
+    df = df.na.drop(how="any", subset=[
+        config.TAXI_DATA_SCHEMA.fieldNames()
+    ].extend([
+        'pickup_datetime_day_of_week',
+        'pickup_datetime_hour_of_day',
+        'pickup_datetime_month_of_year',
+        'dropoff_datetime_day_of_week',
+        'dropoff_datetime_hour_of_day',
+        'dropoff_datetime_month_of_year'
+    ]))
 
+    logging.info('Filling any remaining null values with 99999')
+    # Filling na values with code 99999
+    df = df.na.fill(value=99999)
+
+    logging.info('Spliting records into training and testing sets')
     # Split the data into training and test sets (30% held out for testing)
     (training_df, testing_df) = df.randomSplit([0.7, 0.3])
 
@@ -285,10 +305,8 @@ def main():
         inputCols=[col for col in df.columns if col not in ignore],
         outputCol='features')
     # Transform the data using the defined assembler
+    logging.info('Transforming data using VectorAssembler')
     df = assembler.transform(df)
-
-    # Why does some of this look like its wrapped in a tuple?
-    # print(df.select('features').show(10))
 
     # Define a "VectorIndexer" which converts categorical fields (defined by having less than 20 unique values) into
     # one-hot (?) encoded data
@@ -300,15 +318,18 @@ def main():
     # Chain assembler, indexer and GBT in a Pipeline
     pipeline = Pipeline(stages=[assembler, feature_indexer, gbt])
 
+    logging.info('Running model pipeline')
     # Train model.  This also runs the indexer.
     model_pipeline = pipeline.fit(training_df)
 
-    # Make predictions.
+    logging.info('Making model predictions')
+    # Make predictions
     predictions = model_pipeline.transform(testing_df)
 
     # Select example rows to display
     predictions.select("prediction", "label", "features").show(5)
 
+    logging.info('Evaluating predictions')
     # Select (prediction, true label) and compute test error
     evaluator = RegressionEvaluator(
         labelCol="label", predictionCol="prediction", metricName="rmse")
